@@ -3,211 +3,331 @@ use opencv::imgproc::*;
 
 use crate::piano::octave::*;
 
-pub const NOTE_C 		: usize = 0;
-pub const NOTE_CSHARP	: usize = 1;
-pub const NOTE_D 		: usize = 2;
-pub const NOTE_DSHARP 	: usize = 3;
-pub const NOTE_E 		: usize = 4;
-pub const NOTE_F 		: usize = 5;
-pub const NOTE_FSHARP 	: usize = 6;
-pub const NOTE_G 		: usize = 7;
-pub const NOTE_GSHARP 	: usize = 8;
-pub const NOTE_A 		: usize = 9;
-pub const NOTE_ASHARP 	: usize = 10;
-pub const NOTE_B 		: usize = 11;
-
+// Semitone offset of each white key from the C that starts its octave
+const WHITE_KEY_CLASSES: [i32; 7] = [0, 2, 4, 5, 7, 9, 11];
 
 pub struct Piano {
 	pub octaves: Vec<Octave>,
 }
 
+// A horizontal run of same-brightness pixels along the sampled row
+struct Run {
+	light: bool,
+	start: i32,
+	end: i32, // exclusive
+}
+
+impl Run {
+	fn width(&self) -> i32 { self.end - self.start }
+	fn center(&self) -> i32 { (self.start + self.end) / 2 }
+}
+
+// One detected key. White keys carry their own index along the keyboard,
+// black keys carry the index of the white key immediately to their left.
+struct Key {
+	white_index: usize,
+	black: bool,
+	x: i32,
+}
+
 impl Piano {
-	
-	pub fn new(image: &Mat, unscaled_template: &Mat) -> Piano {
 
-		// Scale template to fit the full image
-		let template: Mat = get_scaled_template(&image, &unscaled_template);
+	// Returns None if this frame has no usable keyboard on screen,
+	//	which covers intro frames, fades and title cards.
+	pub fn new(image: &Mat, transpose: i32) -> Option<Piano> {
+		let mut gray: Mat = Mat::default();
+		cvt_color_def(image, &mut gray, COLOR_BGR2GRAY).ok()?;
 
-		// Matrix to store the match_tempalte results
-		let mut result: Mat = Mat::new_rows_cols_with_default(image.rows()-template.rows()+1, image.cols()-template.cols()+1, CV_32FC1, Scalar::all(0.0)).unwrap();
-			
-		// Do the Matching
-		match_template(&image, &template, &mut result, TM_SQDIFF_NORMED, &Mat::default().unwrap()).unwrap();
-		
-		// Vector to store the found octaves
+		let (band_top, band_bottom) = find_keyboard_band(&gray)?;
+
+		// Sample near the top of the keys, where the black keys are still drawn,
+		//	so that a single row shows the full 12 semitone pattern
+		let sample_y = band_top + ((band_bottom - band_top) * 30) / 100;
+		let runs = encode_row(&gray, sample_y)?;
+
+		let (keys, white_count, c_white) = read_keys(&runs)?;
+		let c_midi = anchor_octave(&keys, white_count, c_white);
+
+		// Sample every key, and work out the typical colour of a white and of a
+		//	black key so that any key lit up in this frame can be spotted below
+		let mut samples: Vec<Vec3b> = Vec::with_capacity(keys.len());
+		for key in &keys {
+			samples.push(*image.at_2d(sample_y, key.x).ok()?);
+		}
+		let white_resting = median_color(&keys, &samples, false);
+		let black_resting = median_color(&keys, &samples, true);
+
+		// Build the notes, grouped by the octave they belong to
 		let mut octaves: Vec<Octave> = Vec::new();
-		
-		// Threshold the result so finding octaves is easier
-		// Loop incrementing the thresh each time until matches are found
-		let mut thresh: f64 = 0.0;
-		let thresh_step: f64 = 0.02;
-		loop {
-			let mut threshold_result = Mat::default().unwrap();
-			threshold(&result, &mut threshold_result, thresh, 1.0, THRESH_BINARY).unwrap();
-			
-			// Loop to store in the octaves vector every found match
-			loop {
-				// Localizing the best match with minMaxLoc
-				let mut min_val: f64 = 0.0;
-				let mut max_val: f64 = 0.0;
-				let mut min_loc: Point = Point {x: 0, y: 0};
-				let mut max_loc: Point = Point {x: 0, y: 0};
+		let mut current: Vec<Note> = Vec::new();
+		let mut current_octave: i32 = i32::MIN;
 
-				min_max_loc(&threshold_result, &mut min_val, &mut max_val, &mut min_loc, &mut max_loc, &Mat::default().unwrap()).unwrap();
-				
-				// Stop if there are no matches
-				if max_val==min_val {break;}
-				
-				// Find the notes of the match and save them to the vector
-				octaves.push(Octave::new(min_loc, &image, &template));
+		for (i, key) in keys.iter().enumerate() {
+			let code = key_midi(key, c_white, c_midi) + transpose;
 
-				// Filling the found point with a white rectangle
-				// This is done so min_max_loc can locate the next instance of the template when it loops
-				rectangle_points(&mut threshold_result,
-					Point { x: min_loc.x - 10, y: 0 },
-					Point { x: min_loc.x + template.cols() - 10 , y: image.rows() },
-					Scalar::all(1.0), -1, 4, 0)
-				.unwrap();
+			// Anything outside this range cannot be written to a MIDI file
+			if code < 0 || code > 127 {
+				continue;
 			}
-			
-			// Stop looping if matches have been found
-			if !octaves.is_empty() {
-				break;
+
+			let octave = code / 12;
+			if octave != current_octave && !current.is_empty() {
+				octaves.push(Octave::new(std::mem::take(&mut current)));
 			}
-			// Panic if no matches are found ever
-			if thresh > 1.0 {
-				panic!();
+			current_octave = octave;
+
+			// A key that was already lit in the detection frame would otherwise
+			//	record its pressed colour as its resting colour
+			let resting = if key.black { black_resting } else { white_resting };
+			let mut diff: i32 = 0;
+			for channel in 0..3 {
+				diff = diff + (samples[i][channel] as i32 - resting[channel] as i32).abs();
 			}
-			// Otherwise, increase thresh and loop
-			thresh = thresh + thresh_step;
-			
+			let default_color = if diff > 100 { resting } else { samples[i] };
+
+			current.push(Note::new(
+				code as u8,
+				Point { x: key.x, y: sample_y },
+				default_color
+			));
+		}
+		if !current.is_empty() {
+			octaves.push(Octave::new(current));
+		}
+		if octaves.is_empty() {
+			return None;
 		}
 
-		// Build Piano struct
-		let mut piano: Piano = Piano {
-			octaves: octaves
-		};
-		piano.sort_octaves(&image); // Sort it and assign note codes
-		
-		return piano;
-	}
-	
-	
-	fn sort_octaves(&mut self, image: &Mat) {
-		// Convert image to grayscale
-		let mut image_gray: Mat = Mat::default().unwrap();
-		cvt_color(&image, &mut image_gray, COLOR_RGB2GRAY, 0).unwrap();
-
-		// Order octaves from lowest to highest
-		//	Sort by x coordinate, the more to the left it is, the lowest the octave is
-		self.octaves.sort_by(|a, b| a.notes[0].location.x.cmp(&b.notes[0].location.x));
-
-		// FIND MIDDLE C:
-		// For each C of each octave check for a gray dot
-		let mut middle_c_octave_index = 0;
-		for (index, octave) in self.octaves.iter().enumerate() {
-			let note = &octave.notes[NOTE_C];
-			
-			// Probe for a gray pixel
-			let thresh = 10;
-			for y in note.location.y..image.rows()-20 {
-				let pixel: Vec3b = *image.at_2d(y, note.location.x).unwrap();
-				
-				// If the difference between the note's default color and the current pixel is greater than the threshold
-				//	The pixel is considered gray
-				//	Therefore, this is the middle C
-				if (note.default_color[0] as i32 - pixel[0] as i32) > thresh {
-					middle_c_octave_index = index;
-					break;
-				}
-			}
-		}
-
-		// Update note codes		
-		let index_to_octave_number: u8 = /* middle C = C4 + 1 because midi*/ 5 - middle_c_octave_index as u8; // Add this to an octave index to get the octave number
-		
-		// Update note codes
-		let mut octave_index = 0;
-		for octave in &mut self.octaves {
-			for mut note in &mut octave.notes {
-				note.code = ((octave_index+index_to_octave_number) * 12) as u8 + note.code;
-			}
-			octave_index = octave_index + 1;
-		}
-	}
-	
-	pub fn draw_notes(&self, image: &Mat) -> Mat {
-		let mut image_show_octaves = Mat::default().unwrap();
-		image.copy_to(&mut image_show_octaves).unwrap();
-		
-		for octave in &self.octaves {			
-			// Draw octave line
-			rectangle_points( &mut image_show_octaves,
-				octave.notes[NOTE_C].location, octave.notes[NOTE_B].location,
-				Scalar::new(255.0, 170.0, 50.0, 255.0), 2, 8, 0)
-			.unwrap();
-
-			// Draw each note
-			for note in &octave.notes {
-				circle( &mut image_show_octaves, note.location, 4, Scalar::new(202.0, 170.0, 70.0,255.0), -1, 8, 0).unwrap();
-			}
-		}
-		
-		return image_show_octaves;
+		return Some(Piano { octaves: octaves });
 	}
 
 }
 
-fn get_scaled_template(image: &Mat, template: &Mat) -> Mat {
-	// Make Mat to store the scaled image
-	let mut image_scaled: Mat = Mat::default().unwrap();
-
-	// Variables to store the best match size and match value
-	let mut found_scaled_width = template.size().unwrap().width;
-	let mut found_min_val: f64 = 1.0;
-	
-	// Loop from the size of the unscaled template to the size of the image
-	for scaled_width in template.size().unwrap().width..image.size().unwrap().width {
-		
-		// Resize the image to scale_width x scale_height
-		let scale_proportion: f64 = scaled_width as f64 / image.size().unwrap().width as f64;
-		let scaled_height = (image.size().unwrap().height as f64 * scale_proportion) as i32;
-		resize(&image, &mut image_scaled, Size {width: scaled_width, height: scaled_height}, 0.0, 0.0, INTER_NEAREST).unwrap();
-		
-		// Do the Matching
-		let mut result_scaled: Mat = Mat::default().unwrap();
-		match_template(&image_scaled, &template, &mut result_scaled, TM_SQDIFF_NORMED, &Mat::default().unwrap()).unwrap();
-		
-		// Localizing the best match with minMaxLoc
-		let mut min_val: f64 = 0.0;
-		let mut max_val: f64 = 0.0;
-		let mut min_loc: Point = Point {x: 0, y: 0};
-		let mut max_loc: Point = Point {x: 0, y: 0};
-
-		min_max_loc(&result_scaled, &mut min_val, &mut max_val, &mut min_loc, &mut max_loc, &Mat::default().unwrap()).unwrap();
-		
-		// Store match if it's better than the previously stored match (Lower = Better)
-		if min_val < found_min_val {
-			found_scaled_width = scaled_width;
-			found_min_val = min_val;			
-		}
-		
-		// Exit if the match is as good as it can get
-		if min_val == 0.0 {break;}
-		
-		// Heuristic to avoid scaling up for nothing
-		//	Exit if it's been a long time since a good match has been found
-		if scaled_width - found_scaled_width > 100 {break;}		
+// Find the rows the keyboard occupies. It is the lowest solid band of lit rows
+// in the frame, far brighter than the falling note background above it.
+fn find_keyboard_band(gray: &Mat) -> Option<(i32, i32)> {
+	let rows = gray.rows();
+	if rows < 40 {
+		return None;
 	}
-	
-	
-	let mut scaled_template: Mat = Mat::default().unwrap();
-	let scale = image.size().unwrap().width / found_scaled_width;
-	
-	resize(&template, &mut scaled_template,
-		Size {width: template.size().unwrap().width * scale , height: 1},
-		0.0, 0.0, INTER_NEAREST)
-	.unwrap();
-	
-	return scaled_template;
+
+	let mut means: Vec<f64> = Vec::with_capacity(rows as usize);
+	for y in 0..rows {
+		let row = gray.row(y).ok()?;
+		means.push(mean_def(&row).ok()?[0]);
+	}
+
+	let brightest = means.iter().cloned().fold(0.0, f64::max);
+	let thresh = f64::max(20.0, brightest * 0.15);
+
+	// Videos often leave a black margin under the keyboard, so walk up to it
+	//	rather than assuming it reaches the bottom edge of the frame
+	let mut bottom = rows - 1;
+	while bottom > 0 && means[bottom as usize] < thresh {
+		bottom = bottom - 1;
+	}
+	let mut top = bottom;
+	while top > 0 && means[(top - 1) as usize] >= thresh {
+		top = top - 1;
+	}
+
+	// A real keyboard is a band in the lower part of the frame, not a stray line
+	if bottom - top < 20 || bottom < rows/2 {
+		return None;
+	}
+	return Some((top, bottom));
+}
+
+// Per channel median colour across every key of one type. Keys lit up in the
+// sampled frame are a minority, so the median lands on the resting colour.
+fn median_color(keys: &Vec<Key>, samples: &Vec<Vec3b>, black: bool) -> Vec3b {
+	let mut out: [u8; 3] = [0, 0, 0];
+	for channel in 0..3 {
+		let mut values: Vec<u8> = keys.iter().zip(samples.iter())
+			.filter(|(key, _)| key.black == black)
+			.map(|(_, sample)| sample[channel])
+			.collect();
+		if values.is_empty() {
+			continue;
+		}
+		values.sort();
+		out[channel] = values[values.len()/2];
+	}
+	return Vec3b::from(out);
+}
+
+// Split one pixel row into alternating light and dark runs
+fn encode_row(gray: &Mat, y: i32) -> Option<Vec<Run>> {
+	let cols = gray.cols();
+	let mut values: Vec<u8> = Vec::with_capacity(cols as usize);
+	for x in 0..cols {
+		values.push(*gray.at_2d::<u8>(y, x).ok()?);
+	}
+
+	let lo = *values.iter().min()? as i32;
+	let hi = *values.iter().max()? as i32;
+	// A flat row has no keys to segment
+	if hi - lo < 40 {
+		return None;
+	}
+	let thresh = ((lo + hi) / 2) as u8;
+
+	let mut runs: Vec<Run> = Vec::new();
+	let mut start: i32 = 0;
+	let mut light = values[0] > thresh;
+	for x in 1..cols {
+		let is_light = values[x as usize] > thresh;
+		if is_light != light {
+			runs.push(Run { light: light, start: start, end: x });
+			start = x;
+			light = is_light;
+		}
+	}
+	runs.push(Run { light: light, start: start, end: cols });
+
+	return Some(runs);
+}
+
+// Turn the runs into keys, and work out where the first C sits
+fn read_keys(runs: &Vec<Run>) -> Option<(Vec<Key>, usize, usize)> {
+	let mut white_widths: Vec<i32> = runs.iter().filter(|r| r.light).map(|r| r.width()).collect();
+	if white_widths.len() < 8 {
+		return None;
+	}
+	white_widths.sort();
+	let white_width = white_widths[white_widths.len()/2];
+
+	// A black key is roughly as wide as the visible part of a white key, while
+	//	the separator drawn between two adjacent white keys is only a few pixels
+	let black_min_width = std::cmp::max(white_width/2, 2);
+
+	let mut keys: Vec<Key> = Vec::new();
+	let mut gaps: Vec<usize> = Vec::new();
+	let mut white_count: usize = 0;
+
+	for (i, run) in runs.iter().enumerate() {
+		if run.light {
+			keys.push(Key { white_index: white_count, black: false, x: run.center() });
+			white_count = white_count + 1;
+			continue;
+		}
+
+		// Skip the dark borders of the frame itself
+		if i == 0 || i == runs.len()-1 || white_count == 0 {
+			continue;
+		}
+
+		if run.width() >= black_min_width {
+			keys.push(Key { white_index: white_count-1, black: true, x: run.center() });
+		} else {
+			gaps.push(white_count - 1);
+		}
+	}
+	if keys.is_empty() {
+		return None;
+	}
+
+	// Two white keys with nothing between them are only ever E|F and B|C.
+	//	Those two gaps are 3 white keys apart one way and 4 the other, which is
+	//	enough to pin every key on the keyboard to a real note name.
+	let mut c_white: Option<usize> = None;
+	for pair in gaps.windows(2) {
+		match pair[1] as i32 - pair[0] as i32 {
+			3 => { c_white = Some(pair[0] + 1); break; } // pair[0] is B|C, so the next white key is C
+			4 => { c_white = Some(pair[0] + 5); break; } // pair[0] is E|F, so C is 4 white keys further on
+			_ => {}
+		}
+	}
+
+	return Some((keys, white_count, c_white? % 7));
+}
+
+// MIDI note number for one key, given which white key is the first C and which
+// real octave that C belongs to
+fn key_midi(key: &Key, c_white: usize, c_midi: i32) -> i32 {
+	let octave_offset = (key.white_index as i32 - c_white as i32).div_euclid(7);
+	let class = WHITE_KEY_CLASSES[(key.white_index + 7 - c_white) % 7];
+	return c_midi + 12*octave_offset + class + if key.black {1} else {0};
+}
+
+// Decide which real octave the keyboard sits in. A full 88 key keyboard is
+// unambiguous. Anything else gets centred on middle C, and the caller can
+// correct it with the transpose argument.
+fn anchor_octave(keys: &Vec<Key>, white_count: usize, c_white: usize) -> i32 {
+	// 88 keys start at A0, which puts the first C at C1
+	if white_count == 52 {
+		return 24;
+	}
+
+	let mut best = 48;
+	let mut best_err = i32::MAX;
+	for c_midi in (12..=96).step_by(12) {
+		let lowest = key_midi(keys.first().unwrap(), c_white, c_midi);
+		let highest = key_midi(keys.last().unwrap(), c_white, c_midi);
+		let err = ((lowest + highest)/2 - 60).abs();
+		if err < best_err {
+			best_err = err;
+			best = c_midi;
+		}
+	}
+	return best;
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// The run pattern an 88 key keyboard produces: a white key, then either a
+	// black key or the thin separator that marks an E|F or B|C pair
+	fn keyboard_88() -> Vec<Run> {
+		let mut runs: Vec<Run> = Vec::new();
+		let mut x = 0;
+		let push = |runs: &mut Vec<Run>, light: bool, width: i32, x: &mut i32| {
+			runs.push(Run { light: light, start: *x, end: *x + width });
+			*x = *x + width;
+		};
+
+		push(&mut runs, false, 2, &mut x); // frame edge
+		for white in 0..52 {
+			push(&mut runs, true, 20, &mut x);
+			if white == 51 {
+				break;
+			}
+			// White keys 1 and 4 mod 7 are B and E, the two with no black key after
+			let class = WHITE_KEY_CLASSES[(white + 7 - 2) % 7];
+			let width = if class == 4 || class == 11 { 3 } else { 23 };
+			push(&mut runs, false, width, &mut x);
+		}
+		push(&mut runs, false, 2, &mut x); // frame edge
+		return runs;
+	}
+
+	#[test]
+	fn reads_a_full_88_key_keyboard() {
+		let (keys, white_count, c_white) = read_keys(&keyboard_88()).unwrap();
+
+		assert_eq!(white_count, 52, "an 88 key piano has 52 white keys");
+		assert_eq!(keys.len(), 88);
+		assert_eq!(c_white, 2, "the keyboard opens on A0, B0, then C1");
+	}
+
+	#[test]
+	fn names_the_outer_keys_correctly() {
+		let (keys, white_count, c_white) = read_keys(&keyboard_88()).unwrap();
+		let c_midi = anchor_octave(&keys, white_count, c_white);
+
+		assert_eq!(c_midi, 24, "the first C on an 88 key piano is C1");
+		assert_eq!(key_midi(keys.first().unwrap(), c_white, c_midi), 21, "lowest key is A0");
+		assert_eq!(key_midi(keys.last().unwrap(), c_white, c_midi), 108, "highest key is C8");
+	}
+
+	#[test]
+	fn every_key_is_a_semitone_above_the_last() {
+		let (keys, _, c_white) = read_keys(&keyboard_88()).unwrap();
+		let codes: Vec<i32> = keys.iter().map(|k| key_midi(k, c_white, 24)).collect();
+
+		for pair in codes.windows(2) {
+			assert_eq!(pair[1] - pair[0], 1, "gap between {} and {}", pair[0], pair[1]);
+		}
+	}
 }

@@ -1,5 +1,4 @@
 use opencv::core::*;
-use opencv::imgcodecs::*;
 use opencv::videoio::*;
 
 use opencv::highgui::*;
@@ -15,10 +14,15 @@ fn main() {
 	// Load files
 	let video_path = std::env::args().nth(1).expect("Please provide a video as an argument");
 	let mut video: VideoCapture = VideoCapture::from_file(&video_path, CAP_ANY).unwrap();
-	
-	let template: Mat = imread("res/template.png", IMREAD_COLOR).unwrap();
 
-	if !video.is_opened().unwrap() || template.empty().unwrap() {
+	// Optional second argument, in case the keyboard on screen isn't a full 88
+	//	keys and the detected octave ends up off by one
+	let transpose: i32 = match std::env::args().nth(2) {
+		Some(arg) => arg.parse().expect("Transpose must be a whole number of semitones"),
+		None => 0,
+	};
+
+	if !video.is_opened().unwrap() {
 		println!(":(");
 		std::process::exit(1);
 	}
@@ -27,24 +31,72 @@ fn main() {
 	// Make window
 	named_window("Gabo", WINDOW_AUTOSIZE).unwrap();
 	
-	// ----------------
-	// READ FIRST FRAME
-	let mut frame: Mat = Mat::default().unwrap();
-	video.read(&mut frame).unwrap();
-	
-	// Find piano
+	// ---------------
+	// FIND THE PIANO
+	//	Detect from a frame well into the video. The opening frames are often
+	//	black or half way through a fade in, and the key colours sampled there
+	//	would be recorded as the resting colours for the whole run.
 	println!("Finding piano...");
-	let mut piano: Piano = Piano::new(&frame, &template);	
-	
+	let mut frame: Mat = Mat::default();
+	let total_frames = video.get(CAP_PROP_FRAME_COUNT).unwrap();
+
+	let mut piano: Piano = {
+		// A key that is lit up merges into its neighbours and disappears from the
+		//	pattern, so sample frames across the whole video and keep the reading
+		//	that recovered the most keys. A frame with nothing pressed wins.
+		let samples = 12;
+		let mut found: Option<Piano> = None;
+		let mut best_keys: usize = 0;
+
+		for step in 1..=samples {
+			let at = (total_frames * step as f64 / (samples as f64 + 1.0)).floor();
+			video.set(CAP_PROP_POS_FRAMES, at).unwrap();
+			if !video.read(&mut frame).unwrap() {
+				continue;
+			}
+			if let Some(candidate) = Piano::new(&frame, transpose) {
+				let keys: usize = candidate.octaves.iter().map(|o| o.notes.len()).sum();
+				if keys > best_keys {
+					best_keys = keys;
+					found = Some(candidate);
+				}
+			}
+		}
+
+		match found {
+			Some(p) => {
+				println!("Found piano: {} keys, {} octaves", best_keys, p.octaves.len());
+				p
+			},
+			None => {
+				println!("Couldn't find a piano in this video");
+				std::process::exit(1);
+			}
+		}
+	};
+
+	// Rewind, the detection frame was only for measuring the keyboard
+	video.set(CAP_PROP_POS_FRAMES, 0.0).unwrap();
+
 	// ----------
 	// PLAY VIDEO
 	println!("Detecting notes!");
 
 	// MIDI variables
 	let path = path::Path::new("out.mid");
-	let microseconds_per_quarter_note: u32 = video.get(CAP_PROP_FPS).unwrap() as u32 * 1000000;
-	let ticks_per_quarter_note: u32 = 48;
-	let ticks_per_frame: u32 = video.get(CAP_PROP_FPS).unwrap() as u32;
+
+	// Some containers report no frame rate at all
+	let fps: f64 = match video.get(CAP_PROP_FPS).unwrap() {
+		f if f > 1.0 => f,
+		_ => 30.0,
+	};
+
+	// One tick per video frame. A quarter note is worth `ticks_per_quarter_note`
+	//	frames, and the tempo stretches that to match the real frame rate, so a
+	//	fractional rate like 29.97 stays in sync instead of drifting.
+	let ticks_per_quarter_note: u16 = fps.round() as u16;
+	let microseconds_per_quarter_note: u32 = (1_000_000.0 * ticks_per_quarter_note as f64 / fps).round() as u32;
+	let ticks_per_frame: u32 = 1;
 
 	// MIDI messages
 	let mut midi_messages: Vec<Message> = vec![
@@ -65,18 +117,20 @@ fn main() {
 	];
 
 	// Vector storing each note and the color it had on the previous frame
-	//	Initialize with each note's default color
+	//	Seed it from the opening frame rather than from the resting colors: a
+	//	video that opens on black would otherwise look like every key on the
+	//	keyboard was struck at once the moment the picture appears.
+	video.read(&mut frame).unwrap();
 	let mut previous_frame_note_colors: Vec<Vec<Vec3b>> = Vec::new();
 	for octave in &piano.octaves {
 		let mut note_colors_vec: Vec<Vec3b> = Vec::new();
 		for note in &octave.notes {
-			note_colors_vec.push(note.default_color);
+			note_colors_vec.push(*frame.at_2d(note.location.y, note.location.x).unwrap());
 		}
 		previous_frame_note_colors.push(note_colors_vec);
 	}
 
 	// Video variables
-	let total_frames = video.get(CAP_PROP_FRAME_COUNT).unwrap();
 	let mut frame_count: u32 = 0; // number of played frames
 	let mut frame_count_on_last_event: u32 = 0; // because SMF uses time since last event rather than absolute time
 
@@ -183,6 +237,7 @@ fn main() {
 	// Write MIDI
 	let mut midi_writer = Writer::new();
 	midi_writer.running_status(true);
+	midi_writer.time_base(ticks_per_quarter_note);
 	for message in &midi_messages {
     	midi_writer.push(message);
 	}

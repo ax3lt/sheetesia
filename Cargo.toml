@@ -5,5 +5,5 @@ authors = ["alborrajo"]
 edition = "2018"
 
 [dependencies]
-opencv = "0.49"
-ghakuf = "0.5.3"
+opencv = "0.99"
+ghakuf = "0.5.6"
