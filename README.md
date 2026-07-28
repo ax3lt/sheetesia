@@ -8,16 +8,37 @@ Easily turn piano tutorials into music sheet
 
 ## How to use
 
-To compile this project you need [cargo](https://doc.rust-lang.org/cargo/index.html) and [opencv](https://opencv.org/).
+To compile this project you need [cargo](https://doc.rust-lang.org/cargo/index.html) and [OpenCV 4](https://opencv.org/).
 
-- [Compile OpenCV generating a pkg-config file](https://github.com/opencv/opencv/issues/13154#issuecomment-456652297)
+- Install OpenCV 4. On macOS, ```brew install opencv@4```. On Linux, your distribution's ```libopencv-dev``` or equivalent. Either way it has to ship a pkg-config file, otherwise [build it yourself](https://github.com/opencv/opencv/issues/13154#issuecomment-456652297)
 
 - Clone this repository
 
-- Run ```cargo build``` or ```cargo build --release```
+- Point the build at OpenCV and at libclang, which the bindings are generated with. Homebrew keeps opencv@4 keg-only, so on macOS that is:
 
-- Run ```cargo run``` providing the video you want to convert as the first argument
+```sh
+export PKG_CONFIG_PATH=/opt/homebrew/opt/opencv@4/lib/pkgconfig
+export LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib
+export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/llvm/lib
+```
+
+- Run ```cargo build --release```
+
+- Run it with the video you want to convert as the first argument. On macOS the keg-only install needs to be on the library path at runtime too:
+
+```sh
+DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/opencv@4/lib \
+	./target/release/sheetesia "your video.mp4"
+```
 
 - Wait for it to finish
 
 - Done! The resulting midi will be at ```out.mid```
+
+### If the notes come out in the wrong octave
+
+The keyboard is pinned to real note names by its own black key pattern, and a full 88 key keyboard is then unambiguous. A video showing a shorter keyboard is not, so it gets centred on middle C, which can land an octave off. Pass a number of semitones as a second argument to correct it:
+
+```sh
+./target/release/sheetesia "your video.mp4" 12
+```
