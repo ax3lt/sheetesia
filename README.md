@@ -45,6 +45,18 @@ The keyboard is pinned to real note names by its own black key pattern, and a fu
 ./target/release/sheetesia "your video.mp4" 12
 ```
 
+### Stylised videos: `--glow`
+
+Some videos draw the keyboard with a glowing hit line, lit keys that fade in over a few frames, and very faint lines between neighbouring white keys. The default recognition misses most notes there and can misread the keyboard. Add `--glow` anywhere on the command line to switch to the recognition built for them:
+
+```sh
+./target/release/sheetesia "your video.mp4" --glow
+```
+
+It splits white keys joined by a faint separator, only trusts a keyboard reading whose E|F and B|C gaps alternate perfectly (checking 48 frames instead of 12), decides pressed and released against the resting colour with separate thresholds instead of looking for a jump between frames, skips frames where the whole picture is changing (fades, title cards), and drops the glow that spills from a lit white key onto the white key touching it. Without the flag the original recognition runs unchanged.
+
+Known limit: when a black key lights up, the flare can show on the white keys either side of it rather than on the black key itself. On the video this mode was built against, that lost nearly every black key, so the result sounded out of key. For a solo piano video, transcribing the audio track with a piano transcription model (such as ByteDance's `piano_transcription_inference`) gave a far more accurate MIDI.
+
 ## What changed in this fork
 
 ### Why the original stopped working

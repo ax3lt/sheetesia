@@ -34,7 +34,8 @@ impl Piano {
 
 	// Returns None if this frame has no usable keyboard on screen,
 	//	which covers intro frames, fades and title cards.
-	pub fn new(image: &Mat, transpose: i32) -> Option<Piano> {
+	//	`glow` turns on the extra checks for stylised videos, see encode_row and read_keys.
+	pub fn new(image: &Mat, transpose: i32, glow: bool) -> Option<Piano> {
 		let mut gray: Mat = Mat::default();
 		cvt_color_def(image, &mut gray, COLOR_BGR2GRAY).ok()?;
 
@@ -43,9 +44,9 @@ impl Piano {
 		// Sample near the top of the keys, where the black keys are still drawn,
 		//	so that a single row shows the full 12 semitone pattern
 		let sample_y = band_top + ((band_bottom - band_top) * 30) / 100;
-		let runs = encode_row(&gray, sample_y)?;
+		let runs = encode_row(&gray, sample_y, glow)?;
 
-		let (keys, white_count, c_white) = read_keys(&runs)?;
+		let (keys, white_count, c_white) = read_keys(&runs, glow)?;
 		let c_midi = anchor_octave(&keys, white_count, c_white);
 
 		// Sample every key, and work out the typical colour of a white and of a
@@ -157,7 +158,7 @@ fn median_color(keys: &Vec<Key>, samples: &Vec<Vec3b>, black: bool) -> Vec3b {
 }
 
 // Split one pixel row into alternating light and dark runs
-fn encode_row(gray: &Mat, y: i32) -> Option<Vec<Run>> {
+fn encode_row(gray: &Mat, y: i32, glow: bool) -> Option<Vec<Run>> {
 	let cols = gray.cols();
 	let mut values: Vec<u8> = Vec::with_capacity(cols as usize);
 	for x in 0..cols {
@@ -185,11 +186,53 @@ fn encode_row(gray: &Mat, y: i32) -> Option<Vec<Run>> {
 	}
 	runs.push(Run { light: light, start: start, end: cols });
 
+	if glow {
+		return Some(split_merged_whites(runs, &values));
+	}
 	return Some(runs);
 }
 
+// The thin line between two white keys (E|F, B|C) can be only slightly darker
+// than the keys, well above the global threshold, so both keys come out as one
+// run. Split any light run far wider than usual at its darkest interior pixel,
+// as long as that pixel clearly dips below the rest of the run.
+fn split_merged_whites(runs: Vec<Run>, values: &Vec<u8>) -> Vec<Run> {
+	let mut widths: Vec<i32> = runs.iter().filter(|r| r.light).map(|r| r.width()).collect();
+	if widths.is_empty() {
+		return runs;
+	}
+	widths.sort();
+	let typical = widths[widths.len()/2];
+
+	let mut out: Vec<Run> = Vec::with_capacity(runs.len());
+	for run in runs {
+		if !run.light || run.width()*2 < typical*3 {
+			out.push(run);
+			continue;
+		}
+
+		// Keep clear of the run's own edges, which shade into the next key over
+		let margin = run.width() / 4;
+		let inner = &values[(run.start + margin) as usize..(run.end - margin) as usize];
+		let mut sorted: Vec<u8> = values[run.start as usize..run.end as usize].to_vec();
+		sorted.sort();
+		let level = sorted[sorted.len()/2] as i32;
+		let (offset, darkest) = inner.iter().enumerate().min_by_key(|(_, v)| **v).unwrap();
+		if (*darkest as i32) * 100 > level * 92 {
+			out.push(run);
+			continue;
+		}
+
+		let x = run.start + margin + offset as i32;
+		out.push(Run { light: true, start: run.start, end: x });
+		out.push(Run { light: false, start: x, end: x + 1 });
+		out.push(Run { light: true, start: x + 1, end: run.end });
+	}
+	return out;
+}
+
 // Turn the runs into keys, and work out where the first C sits
-fn read_keys(runs: &Vec<Run>) -> Option<(Vec<Key>, usize, usize)> {
+fn read_keys(runs: &Vec<Run>, strict: bool) -> Option<(Vec<Key>, usize, usize)> {
 	let mut white_widths: Vec<i32> = runs.iter().filter(|r| r.light).map(|r| r.width()).collect();
 	if white_widths.len() < 8 {
 		return None;
@@ -230,6 +273,16 @@ fn read_keys(runs: &Vec<Run>) -> Option<(Vec<Key>, usize, usize)> {
 	// Two white keys with nothing between them are only ever E|F and B|C.
 	//	Those two gaps are 3 white keys apart one way and 4 the other, which is
 	//	enough to pin every key on the keyboard to a real note name.
+	//	One misread separator shifts the name of every key after it, so a strict
+	//	reading is only trusted if every gap alternates 3 and 4 white keys apart.
+	if strict {
+		let spacing: Vec<usize> = gaps.windows(2).map(|pair| pair[1] - pair[0]).collect();
+		if spacing.is_empty() || spacing.iter().any(|s| *s != 3 && *s != 4)
+			|| spacing.windows(2).any(|pair| pair[0] + pair[1] != 7) {
+			return None;
+		}
+	}
+
 	let mut c_white: Option<usize> = None;
 	for pair in gaps.windows(2) {
 		match pair[1] as i32 - pair[0] as i32 {
@@ -304,7 +357,7 @@ mod tests {
 
 	#[test]
 	fn reads_a_full_88_key_keyboard() {
-		let (keys, white_count, c_white) = read_keys(&keyboard_88()).unwrap();
+		let (keys, white_count, c_white) = read_keys(&keyboard_88(), false).unwrap();
 
 		assert_eq!(white_count, 52, "an 88 key piano has 52 white keys");
 		assert_eq!(keys.len(), 88);
@@ -312,8 +365,25 @@ mod tests {
 	}
 
 	#[test]
+	fn strict_reading_rejects_a_stray_separator() {
+		assert!(read_keys(&keyboard_88(), true).is_some(), "a clean keyboard passes");
+
+		// Cut one white key in two with a thin dark line, as a misread dip would
+		let mut runs = keyboard_88();
+		let i = runs.iter().position(|r| r.light && r.start > 200).unwrap();
+		let (start, end) = (runs[i].start, runs[i].end);
+		runs.splice(i..=i, vec![
+			Run { light: true, start: start, end: start + 9 },
+			Run { light: false, start: start + 9, end: start + 11 },
+			Run { light: true, start: start + 11, end: end },
+		]);
+		assert!(read_keys(&runs, true).is_none());
+		assert!(read_keys(&runs, false).is_some(), "the default reading keeps its old behaviour");
+	}
+
+	#[test]
 	fn names_the_outer_keys_correctly() {
-		let (keys, white_count, c_white) = read_keys(&keyboard_88()).unwrap();
+		let (keys, white_count, c_white) = read_keys(&keyboard_88(), false).unwrap();
 		let c_midi = anchor_octave(&keys, white_count, c_white);
 
 		assert_eq!(c_midi, 24, "the first C on an 88 key piano is C1");
@@ -322,8 +392,33 @@ mod tests {
 	}
 
 	#[test]
+	fn splits_white_keys_joined_by_a_faint_separator() {
+		// Two normal white keys, then an E|F pair whose separator is only a
+		//	slight dip, so the global threshold read it as one wide key
+		let mut values: Vec<u8> = vec![0; 110];
+		for x in (5..25).chain(35..55).chain(65..105) {
+			values[x] = 125;
+		}
+		values[84] = 110;
+		values[85] = 110;
+		let runs = vec![
+			Run { light: false, start: 0, end: 5 },
+			Run { light: true, start: 5, end: 25 },
+			Run { light: false, start: 25, end: 35 },
+			Run { light: true, start: 35, end: 55 },
+			Run { light: false, start: 55, end: 65 },
+			Run { light: true, start: 65, end: 105 },
+			Run { light: false, start: 105, end: 110 },
+		];
+
+		let out = split_merged_whites(runs, &values);
+		assert_eq!(out.iter().filter(|r| r.light).count(), 4);
+		assert!(out.iter().any(|r| !r.light && r.start == 84 && r.width() == 1));
+	}
+
+	#[test]
 	fn every_key_is_a_semitone_above_the_last() {
-		let (keys, _, c_white) = read_keys(&keyboard_88()).unwrap();
+		let (keys, _, c_white) = read_keys(&keyboard_88(), false).unwrap();
 		let codes: Vec<i32> = keys.iter().map(|k| key_midi(k, c_white, 24)).collect();
 
 		for pair in codes.windows(2) {

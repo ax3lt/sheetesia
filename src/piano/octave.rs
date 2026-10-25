@@ -34,6 +34,10 @@ impl Note {
         }
     }
 
+    pub fn is_pressed(&self) -> bool {
+        return self.pressed;
+    }
+
     // Return Err if the note was in a state and is set to the same state:
     //  If the note was pressed and is set to pressed
     //  If the note wasn't pressed and is set to not pressed
